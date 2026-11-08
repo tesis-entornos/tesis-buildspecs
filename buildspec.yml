@@ -9,12 +9,13 @@ phases:
     commands:
       - '[ -n "${BUILDSPECS_BUCKET:-}" ] || { echo "Falta la variable BUILDSPECS_BUCKET"; exit 1; }'
       - BRANCH_NAME="${CODEBUILD_WEBHOOK_HEAD_REF#refs/heads/}"
-      - echo "Rama: ${BRANCH_NAME}"
-      - 'if [ "${BRANCH_NAME}" = "main" ]; then FOLDER="main"; elif [[ "${BRANCH_NAME}" == feature/* ]]; then FOLDER="${BRANCH_NAME#feature/}"; else echo "La rama ${BRANCH_NAME} no se publica"; exit 1; fi'
+      - echo "Rama ${BRANCH_NAME}"
+      - 'if [ "${BRANCH_NAME}" = "main" ]; then FOLDER="main"; elif [[ "${BRANCH_NAME}" == feature/* ]]; then FOLDER="${BRANCH_NAME#feature/}"; FOLDER="${FOLDER//\//-}"; else echo "La rama ${BRANCH_NAME} no se publica"; exit 1; fi'
       - '[ "${BRANCH_NAME}" = "main" ] || [ "${FOLDER}" != "main" ] || { echo "feature/main pisaría la carpeta main"; exit 1; }'
-      - echo "Carpeta destino: s3://${BUILDSPECS_BUCKET}/${FOLDER}/"
+      - echo "Carpeta destino s3://${BUILDSPECS_BUCKET}/${FOLDER}/"
   build:
     commands:
+      - aws s3 cp buildspecs/ "s3://${BUILDSPECS_BUCKET}/${FOLDER}/" --recursive --no-progress
       - aws s3 sync buildspecs/ "s3://${BUILDSPECS_BUCKET}/${FOLDER}/" --delete --no-progress
   post_build:
     commands:

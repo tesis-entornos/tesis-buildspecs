@@ -12,7 +12,8 @@ apunta a un archivo de ese bucket.
 - **Publicación completa.** En cada push, la carpeta `buildspecs/` se copia **completa** al
   bucket:
   - rama `main` → `s3://<bucket>/main/`
-  - rama `feature/<x>` → `s3://<bucket>/<x>/` (`<x>` tal cual, sin cambiar mayúsculas ni `/`)
+  - rama `feature/<x>` → `s3://<bucket>/<x>/`, con las `/` de `<x>` convertidas a `-`
+    (`feature/ci/tests` → `ci-tests`)
   - cualquier otra rama → el build falla y no publica nada.
 - **Referencia desde CodeBuild.** Cada proyecto apunta a
   `s3://<bucket>/<carpeta>/<archivo>`, donde `<carpeta>` es `main` o la `<x>` de la rama.
@@ -27,8 +28,10 @@ entorno `BUILDSPECS_BUCKET` del proyecto.
 1. **pre_build** (aborta el build si falla): exige `BUILDSPECS_BUCKET`, toma la rama de
    `CODEBUILD_WEBHOOK_HEAD_REF` (`refs/heads/...`) y calcula la carpeta destino. Falla si la
    rama no es `main` ni `feature/*`, y si es `feature/main` (pisaría la carpeta de `main`).
-2. **build**: `aws s3 sync buildspecs/ s3://<bucket>/<carpeta>/ --delete`. La carpeta del
-   bucket queda igual a `buildspecs/` en esa rama (lo borrado en el repo se borra en S3).
+2. **build**: primero `aws s3 cp buildspecs/ s3://<bucket>/<carpeta>/ --recursive`, que sube
+   todos los archivos aunque no hayan cambiado, y después
+   `aws s3 sync buildspecs/ s3://<bucket>/<carpeta>/ --delete`, que borra en S3 lo que ya no
+   está en el repo. La carpeta del bucket queda igual a `buildspecs/` en esa rama.
 3. **post_build**: lista los objetos de la carpeta destino.
 
 Lo que está fuera de `buildspecs/` (este README, el propio `buildspec.yml`) no se publica.
@@ -39,3 +42,4 @@ Lo que está fuera de `buildspecs/` (este README, el propio `buildspec.yml`) no 
 |----------------------|---------------------------|---------------------------------------|
 | `main`               | `buildspecs/build.yml`    | `s3://<bucket>/main/build.yml`        |
 | `feature/cache-pip`  | `buildspecs/build.yml`    | `s3://<bucket>/cache-pip/build.yml`   |
+| `feature/ci/tests`   | `buildspecs/build.yml`    | `s3://<bucket>/ci-tests/build.yml`    |
