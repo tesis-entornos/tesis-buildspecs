@@ -23,7 +23,7 @@ phases:
     on-failure: ABORT
     commands:
       - export BUILD_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      - MISSING=""; for v in AWS_REGION ECR_REGISTRY ECR_REPOSITORY IMAGE_PLATFORM OCI_SOURCE DOCKERFILE BUILD_CONTEXT BASE_BRANCH RELEASE_PREFIX HOTFIX_PREFIX CODEBUILD_RESOLVED_SOURCE_VERSION; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { echo "ERROR - faltan variables$MISSING"; false; }
+      - MISSING=""; for v in AWS_REGION ECR_REGISTRY ECR_REPOSITORY IMAGE_PLATFORM OCI_SOURCE DOCKERFILE BUILD_CONTEXT BASE_BRANCH RELEASE_PREFIX HOTFIX_PREFIX DOCKERHUB_USERNAME DOCKERHUB_TOKEN CODEBUILD_RESOLVED_SOURCE_VERSION; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { echo "ERROR - faltan variables$MISSING"; false; }
       - '[[ "$IMAGE_PLATFORM" =~ ^linux/[a-z0-9]+(/[a-z0-9]+)?$ ]] || { echo "ERROR - IMAGE_PLATFORM invalida ($IMAGE_PLATFORM)"; false; }'
       - '[ -d "$BUILD_CONTEXT" ] || { echo "ERROR - no existe BUILD_CONTEXT $BUILD_CONTEXT"; false; }'
       - '[ -f "$DOCKERFILE" ] || { echo "ERROR - no existe DOCKERFILE $DOCKERFILE"; false; }'
@@ -37,6 +37,7 @@ phases:
       - if [ "$TRIGGER_MODE" = "webhook" ]; then export HEAD_BRANCH="${CODEBUILD_WEBHOOK_HEAD_REF#refs/heads/}"; export PR_NUMBER="${CODEBUILD_WEBHOOK_TRIGGER#pr/}"; else export HEAD_BRANCH="${CODEBUILD_SOURCE_VERSION:-}"; export PR_NUMBER=""; fi
       - if [ "$TRIGGER_MODE" = "webhook" ]; then [[ "$HEAD_BRANCH" == "$RELEASE_PREFIX"?* || "$HEAD_BRANCH" == "$HOTFIX_PREFIX"?* ]] || { echo "ERROR - la rama head $HEAD_BRANCH no es ${RELEASE_PREFIX}* ni ${HOTFIX_PREFIX}*"; false; }; fi
       - echo "Modo $TRIGGER_MODE, rama $HEAD_BRANCH, PR ${PR_NUMBER:-ninguno}, commit $COMMIT_SHA, tag $SHORT_SHA"
+      - echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
       - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
       - if ECR_OUT=$(aws ecr describe-images --region "$AWS_REGION" --registry-id "${ECR_REGISTRY%%.*}" --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$SHORT_SHA" --query "imageDetails[0].imageDigest" --output text 2>&1); then export EXISTING_DIGEST="$ECR_OUT"; export SKIP_BUILD=true; elif grep -q ImageNotFoundException <<< "$ECR_OUT"; then export EXISTING_DIGEST=""; export SKIP_BUILD=false; else echo "$ECR_OUT"; false; fi
       - if [ "$SKIP_BUILD" = "true" ]; then echo "$ECR_REPOSITORY $SHORT_SHA ya existe ($EXISTING_DIGEST); no se construye"; else echo "$ECR_REPOSITORY $SHORT_SHA no existe; se construye"; fi
