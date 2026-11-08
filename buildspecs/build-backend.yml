@@ -1,0 +1,67 @@
+version: 0.2
+
+# Build único del backend: tests con servicios descartables (mismo método que
+# scripts/run-tests.sh) y, si pasan, imagen runtime con tag SHORT_SHA en ECR.
+# Los proyectos de CodeBuild pueden sobrescribir cualquier variable de env.variables.
+
+env:
+  shell: bash
+  variables:
+    AWS_REGION: us-east-2
+    ECR_REGISTRY: 582621604637.dkr.ecr.us-east-2.amazonaws.com
+    ECR_REPOSITORY: tesis-backend
+    IMAGE_PLATFORM: linux/arm64
+    OCI_SOURCE: https://github.com/tesis-entornos/tesis-backend
+    DOCKERFILE: Dockerfile
+    BUILD_CONTEXT: .
+    TEST_TARGET: test
+    BASE_BRANCH: main
+    RELEASE_PREFIX: release/
+    HOTFIX_PREFIX: hotfix/
+    FORCE_BUILD: "false"
+    # Tests: imagen local del target de prueba (la usan prestart y backend en compose.yml),
+    # archivo que se copia a .env (como en el README) y comando dentro del servicio.
+    BACKEND_TEST_IMAGE: tesis-backend:test
+    COMPOSE_PROJECT_NAME: tesis-backend-ci
+    TEST_ENV_FILE: .env.example
+    TEST_SERVICE: backend
+    TEST_COMMAND: bash scripts/tests-start.sh
+
+phases:
+  pre_build:
+    on-failure: ABORT
+    commands:
+      - export BUILD_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      - MISSING=""; for v in AWS_REGION ECR_REGISTRY ECR_REPOSITORY IMAGE_PLATFORM OCI_SOURCE DOCKERFILE BUILD_CONTEXT TEST_TARGET BASE_BRANCH RELEASE_PREFIX HOTFIX_PREFIX BACKEND_TEST_IMAGE COMPOSE_PROJECT_NAME TEST_ENV_FILE TEST_SERVICE TEST_COMMAND CODEBUILD_RESOLVED_SOURCE_VERSION; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { echo "ERROR - faltan variables$MISSING"; false; }
+      - '[[ "$IMAGE_PLATFORM" =~ ^linux/[a-z0-9]+(/[a-z0-9]+)?$ ]] || { echo "ERROR - IMAGE_PLATFORM invalida ($IMAGE_PLATFORM)"; false; }'
+      - '[ -d "$BUILD_CONTEXT" ] || { echo "ERROR - no existe BUILD_CONTEXT $BUILD_CONTEXT"; false; }'
+      - '[ -f "$DOCKERFILE" ] || { echo "ERROR - no existe DOCKERFILE $DOCKERFILE"; false; }'
+      - grep -qiE "^FROM[[:space:]].*[[:space:]]AS[[:space:]]+${TEST_TARGET}[[:space:]]*$" "$DOCKERFILE" || { echo "ERROR - el Dockerfile no tiene el target $TEST_TARGET"; false; }
+      - '[ -f compose.yml ] || { echo "ERROR - no existe compose.yml"; false; }'
+      - '[ -f "$TEST_ENV_FILE" ] || { echo "ERROR - no existe TEST_ENV_FILE $TEST_ENV_FILE"; false; }'
+      - docker buildx version && docker compose version
+      - export COMMIT_SHA="$CODEBUILD_RESOLVED_SOURCE_VERSION"
+      - '[[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR - COMMIT_SHA no es un SHA de 40 caracteres ($COMMIT_SHA)"; false; }'
+      - export SHORT_SHA="${COMMIT_SHA:0:7}"
+      - if [ -n "${CODEBUILD_WEBHOOK_TRIGGER:-}" ] || [ -n "${CODEBUILD_WEBHOOK_HEAD_REF:-}" ]; then export TRIGGER_MODE=webhook; elif [ "$FORCE_BUILD" = "true" ]; then export TRIGGER_MODE=manual; else echo "ERROR - build sin webhook; para lanzarlo a mano usar FORCE_BUILD=true"; false; fi
+      - if [ "$TRIGGER_MODE" = "webhook" ]; then [[ "${CODEBUILD_WEBHOOK_TRIGGER:-}" == pr/* ]] || { echo "ERROR - el evento no es un PR (trigger ${CODEBUILD_WEBHOOK_TRIGGER:-vacio})"; false; }; fi
+      - if [ "$TRIGGER_MODE" = "webhook" ]; then [ "${CODEBUILD_WEBHOOK_BASE_REF:-}" = "refs/heads/$BASE_BRANCH" ] || { echo "ERROR - la base del PR es ${CODEBUILD_WEBHOOK_BASE_REF:-vacia}, se esperaba refs/heads/$BASE_BRANCH"; false; }; fi
+      - if [ "$TRIGGER_MODE" = "webhook" ]; then export HEAD_BRANCH="${CODEBUILD_WEBHOOK_HEAD_REF#refs/heads/}"; export PR_NUMBER="${CODEBUILD_WEBHOOK_TRIGGER#pr/}"; else export HEAD_BRANCH="${CODEBUILD_SOURCE_VERSION:-}"; export PR_NUMBER=""; fi
+      - if [ "$TRIGGER_MODE" = "webhook" ]; then [[ "$HEAD_BRANCH" == "$RELEASE_PREFIX"?* || "$HEAD_BRANCH" == "$HOTFIX_PREFIX"?* ]] || { echo "ERROR - la rama head $HEAD_BRANCH no es ${RELEASE_PREFIX}* ni ${HOTFIX_PREFIX}*"; false; }; fi
+      - echo "Modo $TRIGGER_MODE, rama $HEAD_BRANCH, PR ${PR_NUMBER:-ninguno}, commit $COMMIT_SHA, tag $SHORT_SHA"
+      - aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+      - if ECR_OUT=$(aws ecr describe-images --region "$AWS_REGION" --registry-id "${ECR_REGISTRY%%.*}" --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$SHORT_SHA" --query "imageDetails[0].imageDigest" --output text 2>&1); then export EXISTING_DIGEST="$ECR_OUT"; export SKIP_BUILD=true; elif grep -q ImageNotFoundException <<< "$ECR_OUT"; then export EXISTING_DIGEST=""; export SKIP_BUILD=false; else echo "$ECR_OUT"; false; fi
+      - if [ "$SKIP_BUILD" = "true" ]; then echo "$ECR_REPOSITORY $SHORT_SHA ya existe ($EXISTING_DIGEST); no se corren tests ni se construye"; else echo "$ECR_REPOSITORY $SHORT_SHA no existe; se corren tests y se construye"; fi
+  build:
+    commands:
+      - if [ "$SKIP_BUILD" != "true" ]; then docker buildx build --platform "$IMAGE_PLATFORM" --target "$TEST_TARGET" --file "$DOCKERFILE" --tag "$BACKEND_TEST_IMAGE" --load "$BUILD_CONTEXT"; fi
+      - if [ "$SKIP_BUILD" != "true" ]; then cp "$TEST_ENV_FILE" .env && docker compose down -v --remove-orphans; fi
+      - if [ "$SKIP_BUILD" != "true" ]; then docker compose up -d --wait --no-build "$TEST_SERVICE" || { docker compose logs --no-color; false; }; fi
+      - if [ "$SKIP_BUILD" != "true" ]; then docker compose exec -T "$TEST_SERVICE" $TEST_COMMAND || { docker compose logs --no-color; false; }; fi
+      - if [ "$SKIP_BUILD" != "true" ]; then docker compose down -v --remove-orphans; fi
+      - if [ "$SKIP_BUILD" != "true" ]; then docker buildx build --platform "$IMAGE_PLATFORM" --provenance=false --sbom=false --label "org.opencontainers.image.revision=$COMMIT_SHA" --label "org.opencontainers.image.source=$OCI_SOURCE" --file "$DOCKERFILE" --tag "$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA" --push "$BUILD_CONTEXT"; fi
+  post_build:
+    commands:
+      - export BUILD_FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      - if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ]; then IMAGE_DIGEST=$(aws ecr describe-images --region "$AWS_REGION" --registry-id "${ECR_REGISTRY%%.*}" --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$SHORT_SHA" --query "imageDetails[0].imageDigest" --output text) && [[ "$IMAGE_DIGEST" == sha256:* ]]; else echo "El build fallo; no se informa imagen"; fi
+      - if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ]; then jq -nc --arg repo "$ECR_REGISTRY/$ECR_REPOSITORY" --arg commit "$COMMIT_SHA" --arg tag "$SHORT_SHA" --arg digest "$IMAGE_DIGEST" --argjson skip_build "$SKIP_BUILD" --arg head_branch "$HEAD_BRANCH" --arg pr "$PR_NUMBER" --arg started_at "$BUILD_STARTED_AT" --arg finished_at "$BUILD_FINISHED_AT" '{repo:$repo,commit:$commit,tag:$tag,digest:$digest,skip_build:$skip_build,head_branch:$head_branch,pr:(if $pr == "" then null else ($pr|tonumber) end),started_at:$started_at,finished_at:$finished_at}'; fi
