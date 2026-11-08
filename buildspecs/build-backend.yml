@@ -19,6 +19,8 @@ env:
     RELEASE_PREFIX: release/
     HOTFIX_PREFIX: hotfix/
     FORCE_BUILD: "false"
+    # Solo en modo manual: rama a informar (override en start-build); vacía, se informa "manual".
+    HEAD_BRANCH: ""
     # Tests: imagen local del target de prueba (la usan prestart y backend en compose.yml),
     # archivo que se copia a .env (como en el README) y comando dentro del servicio.
     BACKEND_TEST_IMAGE: tesis-backend:test
@@ -46,7 +48,7 @@ phases:
       - if [ -n "${CODEBUILD_WEBHOOK_TRIGGER:-}" ] || [ -n "${CODEBUILD_WEBHOOK_HEAD_REF:-}" ]; then export TRIGGER_MODE=webhook; elif [ "$FORCE_BUILD" = "true" ]; then export TRIGGER_MODE=manual; else echo "ERROR - build sin webhook; para lanzarlo a mano usar FORCE_BUILD=true"; false; fi
       - if [ "$TRIGGER_MODE" = "webhook" ]; then [[ "${CODEBUILD_WEBHOOK_TRIGGER:-}" == pr/* ]] || { echo "ERROR - el evento no es un PR (trigger ${CODEBUILD_WEBHOOK_TRIGGER:-vacio})"; false; }; fi
       - if [ "$TRIGGER_MODE" = "webhook" ]; then [ "${CODEBUILD_WEBHOOK_BASE_REF:-}" = "refs/heads/$BASE_BRANCH" ] || { echo "ERROR - la base del PR es ${CODEBUILD_WEBHOOK_BASE_REF:-vacia}, se esperaba refs/heads/$BASE_BRANCH"; false; }; fi
-      - if [ "$TRIGGER_MODE" = "webhook" ]; then export HEAD_BRANCH="${CODEBUILD_WEBHOOK_HEAD_REF#refs/heads/}"; export PR_NUMBER="${CODEBUILD_WEBHOOK_TRIGGER#pr/}"; else export HEAD_BRANCH="${CODEBUILD_SOURCE_VERSION:-}"; export PR_NUMBER=""; fi
+      - if [ "$TRIGGER_MODE" = "webhook" ]; then export HEAD_BRANCH="${CODEBUILD_WEBHOOK_HEAD_REF#refs/heads/}"; export PR_NUMBER="${CODEBUILD_WEBHOOK_TRIGGER#pr/}"; else export HEAD_BRANCH="${HEAD_BRANCH:-manual}"; export PR_NUMBER=""; fi
       - if [ "$TRIGGER_MODE" = "webhook" ]; then [[ "$HEAD_BRANCH" == "$RELEASE_PREFIX"?* || "$HEAD_BRANCH" == "$HOTFIX_PREFIX"?* ]] || { echo "ERROR - la rama head $HEAD_BRANCH no es ${RELEASE_PREFIX}* ni ${HOTFIX_PREFIX}*"; false; }; fi
       - echo "Modo $TRIGGER_MODE, rama $HEAD_BRANCH, PR ${PR_NUMBER:-ninguno}, commit $COMMIT_SHA, tag $SHORT_SHA"
       - echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
