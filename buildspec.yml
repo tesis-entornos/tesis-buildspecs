@@ -1,59 +1,21 @@
-# Publicador de buildspecs: un solo archivo para todas las ramas.
-# Lo ejecuta el proyecto de CodeBuild tesis-publicar-buildspecs en cada push a main o feature/*.
-# Requiere la variable de entorno BUILDSPECS_BUCKET (definida en el proyecto).
 version: 0.2
 
 env:
   shell: bash
 
 phases:
+  pre_build:
+    on-failure: ABORT
+    commands:
+      - '[ -n "${BUILDSPECS_BUCKET:-}" ] || { echo "Falta la variable BUILDSPECS_BUCKET"; exit 1; }'
+      - BRANCH_NAME="${CODEBUILD_WEBHOOK_HEAD_REF#refs/heads/}"
+      - echo "Rama: ${BRANCH_NAME}"
+      - 'if [ "${BRANCH_NAME}" = "main" ]; then FOLDER="main"; elif [[ "${BRANCH_NAME}" == feature/* ]]; then FOLDER="${BRANCH_NAME#feature/}"; else echo "La rama ${BRANCH_NAME} no se publica"; exit 1; fi'
+      - '[ "${BRANCH_NAME}" = "main" ] || [ "${FOLDER}" != "main" ] || { echo "feature/main pisaría la carpeta main"; exit 1; }'
+      - echo "Carpeta destino: s3://${BUILDSPECS_BUCKET}/${FOLDER}/"
   build:
     commands:
-      - |
-        set -euo pipefail
-
-        : "${BUILDSPECS_BUCKET:?Falta la variable BUILDSPECS_BUCKET}"
-        ref="${CODEBUILD_WEBHOOK_HEAD_REF:-}"
-        rama="${ref#refs/heads/}"
-        echo "Ref: ${ref:-<vacío>} | rama: ${rama:-<vacía>}"
-
-        subidos="$(mktemp)"
-
-        case "$rama" in
-          main)
-            carpeta="main"
-            aws s3 sync main/ "s3://${BUILDSPECS_BUCKET}/main/" --delete --no-progress \
-              | tee /dev/stderr \
-              | sed -n "s|^upload: .* to s3://${BUILDSPECS_BUCKET}/||p" > "$subidos"
-            ;;
-          feature/*)
-            x="${rama#feature/}"
-            carpeta="$(printf '%s' "$x" | tr '[:upper:]' '[:lower:]' | tr '/' '-')"
-            if [ "$carpeta" = "main" ]; then
-              echo "ERROR: la rama '${rama}' se publicaría en la carpeta 'main', reservada para la rama main. Renombrá la rama." >&2
-              exit 1
-            fi
-            git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-            git diff --name-only -z --diff-filter=d origin/main...HEAD -- main/ \
-              | while IFS= read -r -d '' archivo; do
-                  clave="${carpeta}/${archivo#main/}"
-                  aws s3 cp "$archivo" "s3://${BUILDSPECS_BUCKET}/${clave}" --no-progress
-                  printf '%s\n' "$clave" >> "$subidos"
-                done
-            ;;
-          *)
-            echo "La rama '${rama}' no se publica. Nada que hacer."
-            exit 0
-            ;;
-        esac
-
-        echo "Carpeta: ${carpeta}"
-        if [ ! -s "$subidos" ]; then
-          echo "No se subió ningún objeto."
-          exit 0
-        fi
-        echo "Objetos subidos (clave ETag):"
-        while IFS= read -r clave; do
-          aws s3api list-objects-v2 --bucket "$BUILDSPECS_BUCKET" --prefix "$clave" \
-            --query "Contents[?Key=='${clave}'].[Key,ETag]" --output text
-        done < "$subidos"
+      - aws s3 sync buildspecs/ "s3://${BUILDSPECS_BUCKET}/${FOLDER}/" --delete --no-progress
+  post_build:
+    commands:
+      - aws s3 ls "s3://${BUILDSPECS_BUCKET}/${FOLDER}/" --recursive

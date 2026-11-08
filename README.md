@@ -8,13 +8,14 @@ apunta a un archivo de ese bucket.
 
 - **Trunk-based.** `main` es la única rama de larga vida; los cambios entran por ramas
   `feature/*` cortas.
-- **`main/`** tiene todos los buildspecs. Es lo que publica la rama `main`.
-- **Ramas `feature/<x>`.** Cada rama se publica en la carpeta `<x>` en minúsculas y con `/`
-  reemplazado por `-` (por ejemplo, `feature/Cache-Pip` → `cache-pip`,
-  `feature/ci/Tests` → `ci-tests`). Esa carpeta contiene **solo los archivos de `main/` que la
-  rama cambió respecto de `main`**; el resto se sigue leyendo de `main/`.
+- **`buildspecs/`** tiene todos los buildspecs. Es la única carpeta que se publica.
+- **Publicación completa.** En cada push, la carpeta `buildspecs/` se copia **completa** al
+  bucket:
+  - rama `main` → `s3://<bucket>/main/`
+  - rama `feature/<x>` → `s3://<bucket>/<x>/` (`<x>` tal cual, sin cambiar mayúsculas ni `/`)
+  - cualquier otra rama → el build falla y no publica nada.
 - **Referencia desde CodeBuild.** Cada proyecto apunta a
-  `s3://<bucket>/<carpeta>/<archivo>`, donde `<carpeta>` es `main` o la de la rama.
+  `s3://<bucket>/<carpeta>/<archivo>`, donde `<carpeta>` es `main` o la `<x>` de la rama.
 
 ## Publicación (`buildspec.yml`)
 
@@ -23,27 +24,18 @@ El `buildspec.yml` de la raíz lo ejecuta el proyecto de CodeBuild `tesis-public
 `feature/*`. Es un solo archivo para todas las ramas. El bucket llega por la variable de
 entorno `BUILDSPECS_BUCKET` del proyecto.
 
-La rama se toma de `CODEBUILD_WEBHOOK_HEAD_REF` (`refs/heads/...`):
+1. **pre_build** (aborta el build si falla): exige `BUILDSPECS_BUCKET`, toma la rama de
+   `CODEBUILD_WEBHOOK_HEAD_REF` (`refs/heads/...`) y calcula la carpeta destino. Falla si la
+   rama no es `main` ni `feature/*`, y si es `feature/main` (pisaría la carpeta de `main`).
+2. **build**: `aws s3 sync buildspecs/ s3://<bucket>/<carpeta>/ --delete`. La carpeta del
+   bucket queda igual a `buildspecs/` en esa rama (lo borrado en el repo se borra en S3).
+3. **post_build**: lista los objetos de la carpeta destino.
 
-| Rama          | Qué hace                                                                                  |
-|---------------|-------------------------------------------------------------------------------------------|
-| `main`        | `aws s3 sync main/ s3://<bucket>/main/ --delete`: la carpeta `main/` del bucket queda igual al repo. |
-| `feature/<x>` | Calcula la carpeta a partir de `<x>`. Si da `main`, falla. Hace `git fetch` de `origin/main` y sube cada archivo de `git diff --name-only --diff-filter=d origin/main...HEAD -- main/` a `s3://<bucket>/<carpeta>/<ruta sin main/>`. |
-| otra          | No hace nada y termina con 0.                                                             |
-
-Al final imprime cada objeto subido con su ETag.
-
-Detalles:
-
-- El diff es contra el merge-base (`...`): cuentan solo los cambios de la rama, no lo que entró
-  a `main` después.
-- `--diff-filter=d` excluye los archivos borrados en la rama: en la carpeta de la rama no se
-  borra nada. Los archivos fuera de `main/` (este README, el propio `buildspec.yml`) no se
-  publican.
+Lo que está fuera de `buildspecs/` (este README, el propio `buildspec.yml`) no se publica.
 
 ## Ejemplo
 
-| Rama                 | Archivo cambiado     | Objeto publicado                                   |
-|----------------------|----------------------|----------------------------------------------------|
-| `main`               | `main/build.yml`     | `s3://<bucket>/main/build.yml`                     |
-| `feature/Cache-Pip`  | `main/build.yml`     | `s3://<bucket>/cache-pip/build.yml`                |
+| Rama                 | Archivo en el repo        | Objeto publicado                      |
+|----------------------|---------------------------|---------------------------------------|
+| `main`               | `buildspecs/build.yml`    | `s3://<bucket>/main/build.yml`        |
+| `feature/cache-pip`  | `buildspecs/build.yml`    | `s3://<bucket>/cache-pip/build.yml`   |
