@@ -21,6 +21,13 @@ env:
     FORCE_BUILD: "false"
     # Solo en modo manual: rama a informar (override en start-build); vacía, se informa "manual".
     HEAD_BRANCH: ""
+    # CD: repo de configuración (-cd) donde se escribe el digest. GITHUB_CD_REPO, GITHUB_CD_USERNAME
+    # y GITHUB_CD_TOKEN no van acá: los inyecta el proyecto.
+    CD_GITHUB_ORG: tesis-entornos
+    CD_BASE_BRANCH: main
+    CD_TAG_FILE: tag.json
+    CD_GIT_USER_NAME: tesis-build
+    CD_GIT_USER_EMAIL: tesis-build@tesis-entornos.click
     # Tests: imagen local del target de prueba (la usan prestart y backend en compose.yml),
     # archivo que se copia a .env (como en el README) y comando dentro del servicio.
     BACKEND_TEST_IMAGE: tesis-backend:test
@@ -34,7 +41,7 @@ phases:
     on-failure: ABORT
     commands:
       - export BUILD_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      - MISSING=""; for v in AWS_REGION ECR_REGISTRY ECR_REPOSITORY IMAGE_PLATFORM OCI_SOURCE DOCKERFILE BUILD_CONTEXT TEST_TARGET BASE_BRANCH RELEASE_PREFIX HOTFIX_PREFIX BACKEND_TEST_IMAGE COMPOSE_PROJECT_NAME TEST_ENV_FILE TEST_SERVICE TEST_COMMAND DOCKERHUB_USERNAME DOCKERHUB_TOKEN CODEBUILD_RESOLVED_SOURCE_VERSION; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { echo "ERROR - faltan variables$MISSING"; false; }
+      - MISSING=""; for v in AWS_REGION ECR_REGISTRY ECR_REPOSITORY IMAGE_PLATFORM OCI_SOURCE DOCKERFILE BUILD_CONTEXT TEST_TARGET BASE_BRANCH RELEASE_PREFIX HOTFIX_PREFIX BACKEND_TEST_IMAGE COMPOSE_PROJECT_NAME TEST_ENV_FILE TEST_SERVICE TEST_COMMAND DOCKERHUB_USERNAME DOCKERHUB_TOKEN GITHUB_CD_REPO GITHUB_CD_USERNAME GITHUB_CD_TOKEN CD_GITHUB_ORG CD_BASE_BRANCH CD_TAG_FILE CD_GIT_USER_NAME CD_GIT_USER_EMAIL CODEBUILD_RESOLVED_SOURCE_VERSION; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { echo "ERROR - faltan variables$MISSING"; false; }
       - '[[ "$IMAGE_PLATFORM" =~ ^linux/[a-z0-9]+(/[a-z0-9]+)?$ ]] || { echo "ERROR - IMAGE_PLATFORM invalida ($IMAGE_PLATFORM)"; false; }'
       - '[ -d "$BUILD_CONTEXT" ] || { echo "ERROR - no existe BUILD_CONTEXT $BUILD_CONTEXT"; false; }'
       - '[ -f "$DOCKERFILE" ] || { echo "ERROR - no existe DOCKERFILE $DOCKERFILE"; false; }'
@@ -67,4 +74,11 @@ phases:
     commands:
       - export BUILD_FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       - if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ]; then IMAGE_DIGEST=$(aws ecr describe-images --region "$AWS_REGION" --registry-id "${ECR_REGISTRY%%.*}" --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$SHORT_SHA" --query "imageDetails[0].imageDigest" --output text) && [[ "$IMAGE_DIGEST" == sha256:* ]]; else echo "El build fallo; no se informa imagen"; fi
-      - if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ]; then jq -nc --arg repo "$ECR_REGISTRY/$ECR_REPOSITORY" --arg commit "$COMMIT_SHA" --arg tag "$SHORT_SHA" --arg digest "$IMAGE_DIGEST" --argjson skip_build "$SKIP_BUILD" --arg head_branch "$HEAD_BRANCH" --arg pr "$PR_NUMBER" --arg started_at "$BUILD_STARTED_AT" --arg finished_at "$BUILD_FINISHED_AT" '{repo:$repo,commit:$commit,tag:$tag,digest:$digest,skip_build:$skip_build,head_branch:$head_branch,pr:(if $pr == "" then null else ($pr|tonumber) end),started_at:$started_at,finished_at:$finished_at}'; fi
+      - export CD_ESCRITO=false; export CD_COMMIT=""; export CD_PUSHED_AT=""; if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ] && [[ "$HEAD_BRANCH" == "$RELEASE_PREFIX"?* || "$HEAD_BRANCH" == "$HOTFIX_PREFIX"?* ]]; then export CD_WRITE=true; elif [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" != "1" ]; then export CD_WRITE=false; echo "CD - no se escribe en $GITHUB_CD_REPO (build fallido)"; else export CD_WRITE=false; echo "CD - no se escribe en $GITHUB_CD_REPO (la rama $HEAD_BRANCH no es ${RELEASE_PREFIX}* ni ${HOTFIX_PREFIX}*)"; fi
+      - export CD_GIT_AUTH='!f() { echo "username=${GITHUB_CD_USERNAME}"; echo "password=${GITHUB_CD_TOKEN}"; }; f'; export GIT_TERMINAL_PROMPT=0
+      - if [ "$CD_WRITE" = "true" ]; then export CD_DIR="$(mktemp -d)/$GITHUB_CD_REPO" && git -c "credential.helper=$CD_GIT_AUTH" clone --quiet --depth 1 --branch "$CD_BASE_BRANCH" "https://github.com/$CD_GITHUB_ORG/$GITHUB_CD_REPO.git" "$CD_DIR" && git -C "$CD_DIR" config user.name "$CD_GIT_USER_NAME" && git -C "$CD_DIR" config user.email "$CD_GIT_USER_EMAIL"; fi
+      - if [ "$CD_WRITE" = "true" ]; then git -C "$CD_DIR" -c "credential.helper=$CD_GIT_AUTH" ls-remote --exit-code --heads origin "refs/heads/$HEAD_BRANCH" > /dev/null; CD_RC=$?; if [ "$CD_RC" = "0" ]; then git -C "$CD_DIR" -c "credential.helper=$CD_GIT_AUTH" fetch --quiet --depth 1 origin "+refs/heads/$HEAD_BRANCH:refs/remotes/origin/$HEAD_BRANCH" && git -C "$CD_DIR" checkout --quiet -B "$HEAD_BRANCH" "origin/$HEAD_BRANCH" && echo "CD - rama $HEAD_BRANCH existente en $GITHUB_CD_REPO"; elif [ "$CD_RC" = "2" ]; then git -C "$CD_DIR" checkout --quiet -b "$HEAD_BRANCH" && echo "CD - rama $HEAD_BRANCH nueva en $GITHUB_CD_REPO desde $CD_BASE_BRANCH"; else echo "ERROR - no se pudo consultar la rama $HEAD_BRANCH en $GITHUB_CD_REPO"; false; fi; fi
+      - if [ "$CD_WRITE" = "true" ]; then jq -n --arg repo "$ECR_REGISTRY/$ECR_REPOSITORY" --arg commit "$COMMIT_SHA" --arg tag "$SHORT_SHA" --arg digest "$IMAGE_DIGEST" '{repo:$repo,commit:$commit,tag:$tag,digest:$digest}' > "$CD_DIR/$CD_TAG_FILE" && cat "$CD_DIR/$CD_TAG_FILE"; fi
+      - if [ "$CD_WRITE" = "true" ]; then git -C "$CD_DIR" add "$CD_TAG_FILE" && if git -C "$CD_DIR" diff --cached --quiet; then export CD_PUSH=false; echo "CD - $CD_TAG_FILE sin cambios en $GITHUB_CD_REPO $HEAD_BRANCH; no se hace commit ni push"; else git -C "$CD_DIR" commit --quiet -m "$ECR_REPOSITORY $SHORT_SHA ($CODEBUILD_BUILD_ID)" && export CD_PUSH=true; fi; else export CD_PUSH=false; fi
+      - if [ "$CD_PUSH" = "true" ]; then git -C "$CD_DIR" -c "credential.helper=$CD_GIT_AUTH" push --quiet origin "HEAD:refs/heads/$HEAD_BRANCH" && export CD_PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" && export CD_COMMIT="$(git -C "$CD_DIR" rev-parse HEAD)" && export CD_ESCRITO=true && echo "CD - push de $CD_COMMIT a $GITHUB_CD_REPO $HEAD_BRANCH"; fi
+      - if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ]; then jq -nc --arg repo "$ECR_REGISTRY/$ECR_REPOSITORY" --arg commit "$COMMIT_SHA" --arg tag "$SHORT_SHA" --arg digest "$IMAGE_DIGEST" --argjson skip_build "$SKIP_BUILD" --arg head_branch "$HEAD_BRANCH" --arg pr "$PR_NUMBER" --arg started_at "$BUILD_STARTED_AT" --arg finished_at "$BUILD_FINISHED_AT" --argjson cd_escrito "$CD_ESCRITO" --arg cd_commit "$CD_COMMIT" --arg cd_pushed_at "$CD_PUSHED_AT" '{repo:$repo,commit:$commit,tag:$tag,digest:$digest,skip_build:$skip_build,head_branch:$head_branch,pr:(if $pr == "" then null else ($pr|tonumber) end),started_at:$started_at,finished_at:$finished_at,cd_escrito:$cd_escrito,cd_commit:(if $cd_commit == "" then null else $cd_commit end),cd_pushed_at:(if $cd_pushed_at == "" then null else $cd_pushed_at end)}'; fi
