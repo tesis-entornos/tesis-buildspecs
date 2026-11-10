@@ -1,0 +1,30 @@
+version: 0.2
+
+# Despliegue al entorno fijo: por ahora solo de prueba, no despliega nada.
+# Fuente: el repo -cd en el commit de dev que disparó el webhook. Valida tag.json, imprime el
+# contexto del disparo y una línea JSON con la imagen que se desplegaría.
+# SERVICIO y GITHUB_CD_REPO no van acá: los pone el proyecto.
+
+env:
+  shell: bash
+  variables:
+    TAG_FILE: tag.json
+
+phases:
+  pre_build:
+    on-failure: ABORT
+    commands:
+      - export BUILD_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      - MISSING=""; for v in SERVICIO GITHUB_CD_REPO TAG_FILE CODEBUILD_RESOLVED_SOURCE_VERSION CODEBUILD_BUILD_ID; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { echo "ERROR - faltan variables$MISSING"; false; }
+      - '[ -f "$TAG_FILE" ] || { echo "ERROR - no existe $TAG_FILE en la raiz de la fuente"; false; }'
+      - jq -e 'all(.repo, .commit, .tag, .digest; type == "string" and length > 0)' "$TAG_FILE" > /dev/null || { echo "ERROR - $TAG_FILE no tiene repo, commit, tag y digest"; cat "$TAG_FILE"; false; }
+      - export TAG_REPO="$(jq -r .repo "$TAG_FILE")"; export TAG_COMMIT="$(jq -r .commit "$TAG_FILE")"; export TAG_TAG="$(jq -r .tag "$TAG_FILE")"; export TAG_DIGEST="$(jq -r .digest "$TAG_FILE")"
+      - '[[ "$TAG_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "ERROR - digest con formato invalido ($TAG_DIGEST)"; false; }'
+      - echo "Servicio $SERVICIO, imagen $TAG_REPO@$TAG_DIGEST (commit $TAG_COMMIT, tag $TAG_TAG)"
+  build:
+    commands:
+      - for v in CODEBUILD_WEBHOOK_TRIGGER CODEBUILD_WEBHOOK_EVENT CODEBUILD_WEBHOOK_HEAD_REF CODEBUILD_RESOLVED_SOURCE_VERSION CODEBUILD_BUILD_ID; do echo "$v=${!v:-<vacia>}"; done
+      - if git rev-parse --git-dir > /dev/null 2>&1; then export SRC_COMMIT_AT="$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)"; echo "Commit de la fuente $(git log -1 --format=%H) $SRC_COMMIT_AT"; else export SRC_COMMIT_AT=""; echo "La fuente no trae .git; sin commit ni fecha de committer"; fi
+  post_build:
+    commands:
+      - if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ]; then jq -nc --arg servicio "$SERVICIO" --arg cd_repo "$GITHUB_CD_REPO" --arg cd_commit "$CODEBUILD_RESOLVED_SOURCE_VERSION" --arg cd_commit_at "${SRC_COMMIT_AT:-}" --arg trigger "${CODEBUILD_WEBHOOK_TRIGGER:-}" --arg imagen "$TAG_REPO@$TAG_DIGEST" --arg commit_app "$TAG_COMMIT" --arg tag "$TAG_TAG" --arg build_id "$CODEBUILD_BUILD_ID" --arg build_started_at "$BUILD_STARTED_AT" '{servicio:$servicio,cd_repo:$cd_repo,cd_commit:$cd_commit,cd_commit_at:(if $cd_commit_at == "" then null else $cd_commit_at end),trigger:(if $trigger == "" then null else $trigger end),imagen:$imagen,commit_app:$commit_app,tag:$tag,build_id:$build_id,build_started_at:$build_started_at}'; else echo "El build fallo; no se informa imagen"; fi
