@@ -5,10 +5,13 @@
 # FIRST_SUPERUSER_PASSWORD (se pasa al contenedor por nombre, nunca en la línea de comando).
 # Opcionales: SALIDA_JSON (archivo donde además se escribe la línea JSON final), RESULTS_JSON
 # (ruta donde se deja una copia de results.json para el registro; default /tmp/suite/results.json),
+# TEST_RESULTS_DIR (donde queda test-results/ de la corrida, con las trazas del primer reintento;
+# se vacía al empezar; default <directorio de RESULTS_JSON>/test-results),
 # SUITE_TOTAL_ESPERADO (cantidad de tests que tiene que tener la corrida).
 #
 # Corrida: docker run --rm --ipc=host con exactamente las variables de abajo y los volúmenes
-# test-results, playwright-report y blob-report en un directorio temporal;
+# test-results en TEST_RESULTS_DIR (se conserva) y playwright-report y blob-report en un directorio
+# temporal (se borra);
 # bunx playwright test --grep-invert @requires-email.
 # La salida del contenedor pasa por un filtro que reemplaza la contraseña por *** (además del
 # enmascarado de CodeBuild para variables de Secrets Manager).
@@ -29,7 +32,9 @@ MOTIVO=""
 EXIT_CODE=""
 INICIO="$(date -u +%s)"; FIN=""
 RESULTS_JSON="${RESULTS_JSON:-/tmp/suite/results.json}"
+TEST_RESULTS_DIR="${TEST_RESULTS_DIR:-$(dirname "$RESULTS_JSON")/test-results}"
 rm -f "$RESULTS_JSON"
+rm -rf "$TEST_RESULTS_DIR"
 TMP="$(mktemp -d)"
 
 iso() { [ -n "$1" ] && jq -nr --argjson e "$1" '$e | todate' || true; }
@@ -78,6 +83,7 @@ finalizar() {
     --arg exit_code "$EXIT_CODE" --argjson stats "$STATS" --argjson tests "$TESTS" \
     --arg total "$TOTAL" --arg total_esperado "${SUITE_TOTAL_ESPERADO:-}" --argjson errors "$ERRORES" \
     --arg results_json "$([ -s "$RESULTS_JSON" ] && echo "$RESULTS_JSON")" \
+    --arg test_results_dir "$([ -d "$TEST_RESULTS_DIR" ] && echo "$TEST_RESULTS_DIR")" \
     --arg inicio "$(iso "$INICIO")" --arg fin "$(iso "$FIN")" --argjson suite_seg "$((FIN - INICIO))" \
     '{suite_imagen: (if $suite_imagen == "" then null else $suite_imagen end), resultado: $resultado,
       motivo: (if $motivo == "" then null else $motivo end),
@@ -88,6 +94,7 @@ finalizar() {
       fallidos: [$tests[] | select(.estado == "unexpected") | {archivo, titulo, proyecto}],
       errors: $errors,
       results_json: (if $results_json == "" then null else $results_json end),
+      test_results_dir: (if $test_results_dir == "" then null else $test_results_dir end),
       inicio: $inicio, fin: $fin, suite_seg: $suite_seg}')"
   [ -z "${SALIDA_JSON:-}" ] || echo "$RESULTADO" > "$SALIDA_JSON"
   echo "$RESULTADO"
@@ -122,7 +129,7 @@ PULL_INICIO="$(date -u +%s)"
 docker pull --quiet "$SUITE_IMAGEN" > /dev/null
 log "pull en $(( $(date -u +%s) - PULL_INICIO )) s"
 
-mkdir -p "$TMP/test-results" "$TMP/playwright-report" "$TMP/blob-report" "$(dirname "$RESULTS_JSON")"
+mkdir -p "$TEST_RESULTS_DIR" "$TMP/playwright-report" "$TMP/blob-report" "$(dirname "$RESULTS_JSON")"
 log "suite contra $URL (4 workers, 2 retries, --grep-invert @requires-email)"
 # FIRST_SUPERUSER_PASSWORD va solo por nombre: docker toma el valor del entorno de este proceso.
 # El awk reemplaza la contraseña literal (index, no regex) si llegara a aparecer en la salida.
@@ -136,7 +143,7 @@ docker run --rm --ipc=host \
   -e PLAYWRIGHT_HTML_HOST=0.0.0.0 \
   -e MAILPIT_HOST=http://mailpit:8025 \
   -e CI= \
-  -v "$TMP/test-results:/app/test-results" \
+  -v "$TEST_RESULTS_DIR:/app/test-results" \
   -v "$TMP/playwright-report:/app/playwright-report" \
   -v "$TMP/blob-report:/app/blob-report" \
   "$SUITE_IMAGEN" bunx playwright test --grep-invert @requires-email 2>&1 \
@@ -145,7 +152,7 @@ docker run --rm --ipc=host \
   && EXIT_CODE=0 || EXIT_CODE="${PIPESTATUS[0]}"
 log "playwright terminó con exit $EXIT_CODE"
 
-[ -s "$TMP/test-results/results.json" ] || falla "la corrida no dejó test-results/results.json (exit $EXIT_CODE)"
-cp "$TMP/test-results/results.json" "$RESULTS_JSON"
+[ -s "$TEST_RESULTS_DIR/results.json" ] || falla "la corrida no dejó test-results/results.json (exit $EXIT_CODE)"
+cp "$TEST_RESULTS_DIR/results.json" "$RESULTS_JSON"
 log "results.json en $RESULTS_JSON"
 # El resultado lo decide finalizar con el results.json y el exit code.
