@@ -3,10 +3,14 @@ version: 0.2
 # Despliegue al entorno fijo compartido.
 # Fuente: el repo -cd en el commit de dev que disparó el webhook. Valida tag.json, imprime el
 # contexto del disparo y despliega la imagen con scripts/desplegar-<SERVICIO>.sh del bucket, bajo
-# SCRIPTS_PREFIX.
+# SCRIPTS_PREFIX. Si el despliegue sale bien, espera a que el entorno responda
+# (scripts/esperar-entorno.sh) y, si responde, corre la suite E2E (scripts/ejecutar-suite.sh, imagen
+# SUITE_IMAGEN). Una suite con fallos deja el build FAILED.
 # Termina siempre (también si el despliegue falla) con una línea JSON con la imagen, el ETag del
 # script, el resultado del despliegue (ok o fallo) y la imagen que corre el otro servicio del entorno
-# (null con el motivo si no se puede leer; no hace fallar el build).
+# (null con el motivo si no se puede leer; no hace fallar el build), más espera y suite (null con el
+# motivo si no se corrieron). results.json de la suite queda en SUITE_RESULTS.
+# FIRST_SUPERUSER_PASSWORD viene del proyecto (Secrets Manager) y no se imprime.
 # SERVICIO y GITHUB_CD_REPO no van acá: los pone el proyecto.
 
 env:
@@ -18,13 +22,16 @@ env:
     SCRIPTS_BUCKET: tesis-entornos-buildspecs-582621604637
     SCRIPTS_PREFIX: main
     DESPLIEGUE_DIR: /tmp/despliegue
+    SUITE_IMAGEN: 582621604637.dkr.ecr.us-east-2.amazonaws.com/tesis-playwright@sha256:2d5ba44a607236a8d07dc55308e8c0a9e4289caf4c0cf413821d56920e32c9b9
+    SUITE_RESULTS: /tmp/despliegue/suite/results.json
+    SUITE_TOTAL_ESPERADO: "66"
 
 phases:
   pre_build:
     on-failure: ABORT
     commands:
       - export BUILD_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      - MISSING=""; for v in SERVICIO GITHUB_CD_REPO TAG_FILE MODELO SLUG SCRIPTS_BUCKET SCRIPTS_PREFIX DESPLIEGUE_DIR CODEBUILD_RESOLVED_SOURCE_VERSION CODEBUILD_BUILD_ID; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { echo "ERROR - faltan variables$MISSING"; false; }
+      - MISSING=""; for v in SERVICIO GITHUB_CD_REPO TAG_FILE MODELO SLUG SCRIPTS_BUCKET SCRIPTS_PREFIX DESPLIEGUE_DIR SUITE_IMAGEN SUITE_RESULTS SUITE_TOTAL_ESPERADO FIRST_SUPERUSER_PASSWORD CODEBUILD_RESOLVED_SOURCE_VERSION CODEBUILD_BUILD_ID; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { echo "ERROR - faltan variables$MISSING"; false; }
       - '[[ "$SERVICIO" =~ ^(backend|frontend)$ ]] || { echo "ERROR - SERVICIO tiene que ser backend o frontend ($SERVICIO)"; false; }'
       - '[ -f "$TAG_FILE" ] || { echo "ERROR - no existe $TAG_FILE en la raiz de la fuente"; false; }'
       - jq -e 'all(.repo, .commit, .tag, .digest; type == "string" and length > 0)' "$TAG_FILE" > /dev/null || { echo "ERROR - $TAG_FILE no tiene repo, commit, tag y digest"; cat "$TAG_FILE"; false; }
@@ -35,13 +42,19 @@ phases:
     commands:
       - for v in CODEBUILD_WEBHOOK_TRIGGER CODEBUILD_WEBHOOK_EVENT CODEBUILD_WEBHOOK_HEAD_REF CODEBUILD_RESOLVED_SOURCE_VERSION CODEBUILD_BUILD_ID; do echo "$v=${!v:-<vacia>}"; done
       - if git rev-parse --git-dir > /dev/null 2>&1; then export SRC_COMMIT_AT="$(TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd)"; echo "Commit de la fuente $(git log -1 --format=%H) $SRC_COMMIT_AT"; else export SRC_COMMIT_AT=""; echo "La fuente no trae .git; sin commit ni fecha de committer"; fi
-      - export SCRIPT_KEY="$SCRIPTS_PREFIX/scripts/desplegar-$SERVICIO.sh"; export SCRIPT_ETAG=""; export DESPLIEGUE_RESULTADO="$DESPLIEGUE_DIR/resultado.json"; rm -f "$DESPLIEGUE_RESULTADO"; export DESPLIEGUE="pendiente"
+      - export SCRIPT_KEY="$SCRIPTS_PREFIX/scripts/desplegar-$SERVICIO.sh"; export SCRIPT_ETAG=""; export DESPLIEGUE_RESULTADO="$DESPLIEGUE_DIR/resultado.json"; rm -f "$DESPLIEGUE_RESULTADO"; export DESPLIEGUE="pendiente"; export ESPERA="sin_correr"; export ESPERA_ETAG=""; export ESPERA_RESULTADO="$DESPLIEGUE_DIR/espera.json"; export SUITE="sin_correr"; export SUITE_ETAG=""; export SUITE_RESULTADO="$DESPLIEGUE_DIR/suite.json"; rm -f "$ESPERA_RESULTADO" "$SUITE_RESULTADO" "$SUITE_RESULTS"
       - mkdir -p "$DESPLIEGUE_DIR" && export SCRIPT_ETAG="$(aws s3api get-object --bucket "$SCRIPTS_BUCKET" --key "$SCRIPT_KEY" "$DESPLIEGUE_DIR/desplegar-$SERVICIO.sh" --query ETag --output text | tr -d '"')" && [ -n "$SCRIPT_ETAG" ] && echo "Script s3://$SCRIPTS_BUCKET/$SCRIPT_KEY (ETag $SCRIPT_ETAG)" || { export DESPLIEGUE="fallo"; echo "ERROR - no se pudo bajar s3://$SCRIPTS_BUCKET/$SCRIPT_KEY"; false; }
       - IMAGEN="$TAG_REPO@$TAG_DIGEST" SALIDA_JSON="$DESPLIEGUE_RESULTADO" bash "$DESPLIEGUE_DIR/desplegar-$SERVICIO.sh" && export DESPLIEGUE="ok" || { export DESPLIEGUE="fallo"; echo "ERROR - fallo el despliegue de $SERVICIO"; false; }
+      - export ESPERA="pendiente"; export ESPERA_ETAG="$(aws s3api get-object --bucket "$SCRIPTS_BUCKET" --key "$SCRIPTS_PREFIX/scripts/esperar-entorno.sh" "$DESPLIEGUE_DIR/esperar-entorno.sh" --query ETag --output text | tr -d '"')" && [ -n "$ESPERA_ETAG" ] && echo "Script s3://$SCRIPTS_BUCKET/$SCRIPTS_PREFIX/scripts/esperar-entorno.sh (ETag $ESPERA_ETAG)" || { export ESPERA="fallo"; echo "ERROR - no se pudo bajar esperar-entorno.sh"; false; }
+      - SALIDA_JSON="$ESPERA_RESULTADO" bash "$DESPLIEGUE_DIR/esperar-entorno.sh" && export ESPERA="ok" || { export ESPERA="fallo"; echo "ERROR - el entorno no respondio"; false; }
+      - export SUITE="pendiente"; export SUITE_ETAG="$(aws s3api get-object --bucket "$SCRIPTS_BUCKET" --key "$SCRIPTS_PREFIX/scripts/ejecutar-suite.sh" "$DESPLIEGUE_DIR/ejecutar-suite.sh" --query ETag --output text | tr -d '"')" && [ -n "$SUITE_ETAG" ] && echo "Script s3://$SCRIPTS_BUCKET/$SCRIPTS_PREFIX/scripts/ejecutar-suite.sh (ETag $SUITE_ETAG)" || { export SUITE="fallo"; echo "ERROR - no se pudo bajar ejecutar-suite.sh"; false; }
+      - SALIDA_JSON="$SUITE_RESULTADO" RESULTS_JSON="$SUITE_RESULTS" bash "$DESPLIEGUE_DIR/ejecutar-suite.sh" && export SUITE="ok" || { export SUITE="fallo"; echo "ERROR - la suite no dio ok"; false; }
   post_build:
     commands:
       - export OTRO_IMAGEN=""; export OTRO_MOTIVO=""; export OTRO_ERR="$DESPLIEGUE_DIR/otro-servicio.err"; mkdir -p "$DESPLIEGUE_DIR"; rm -f "$OTRO_ERR"
       - if [ "$SERVICIO" = "backend" ]; then export OTRO_ORIGEN="s3://tesis-$MODELO-$SLUG-frontend-$(aws sts get-caller-identity --query Account --output text 2>> "$OTRO_ERR")/_despliegue.json"; export OTRO_IMAGEN="$(aws s3 cp "$OTRO_ORIGEN" - 2>> "$OTRO_ERR" | jq -r '.imagen // empty' 2>> "$OTRO_ERR")"; fi
       - if [ "$SERVICIO" = "frontend" ]; then export OTRO_ORIGEN="servicio $MODELO-$SLUG-backend de $MODELO-cluster"; export OTRO_IMAGEN="$(aws ecs describe-task-definition --task-definition "$(aws ecs describe-services --cluster "$MODELO-cluster" --services "$MODELO-$SLUG-backend" --query 'services[0].taskDefinition' --output text 2>> "$OTRO_ERR")" --query "taskDefinition.containerDefinitions[?name=='backend'] | [0].image" --output text 2>> "$OTRO_ERR")"; fi
       - if [[ "$OTRO_IMAGEN" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]]; then echo "Imagen del otro servicio $OTRO_IMAGEN ($OTRO_ORIGEN)"; else export OTRO_MOTIVO="no se pudo leer la imagen de $OTRO_ORIGEN ($(tr '\n' ' ' < "$OTRO_ERR" 2> /dev/null | cut -c1-300))"; export OTRO_IMAGEN=""; echo "AVISO - $OTRO_MOTIVO"; fi
-      - jq -nc --arg servicio "$SERVICIO" --arg cd_repo "$GITHUB_CD_REPO" --arg cd_commit "$CODEBUILD_RESOLVED_SOURCE_VERSION" --arg cd_commit_at "${SRC_COMMIT_AT:-}" --arg trigger "${CODEBUILD_WEBHOOK_TRIGGER:-}" --arg imagen "$TAG_REPO@$TAG_DIGEST" --arg commit_app "$TAG_COMMIT" --arg tag "$TAG_TAG" --arg build_id "$CODEBUILD_BUILD_ID" --arg build_started_at "$BUILD_STARTED_AT" --arg script "s3://$SCRIPTS_BUCKET/$SCRIPT_KEY" --arg script_etag "${SCRIPT_ETAG:-}" --arg despliegue "${DESPLIEGUE:-}" --arg build_ok "${CODEBUILD_BUILD_SUCCEEDING:-0}" --arg otro_imagen "$OTRO_IMAGEN" --arg otro_motivo "$OTRO_MOTIVO" --argjson despliegue_detalle "$([ -s "$DESPLIEGUE_RESULTADO" ] && cat "$DESPLIEGUE_RESULTADO" || echo null)" '{servicio:$servicio,cd_repo:$cd_repo,cd_commit:$cd_commit,cd_commit_at:(if $cd_commit_at == "" then null else $cd_commit_at end),trigger:(if $trigger == "" then null else $trigger end),imagen:$imagen,commit_app:$commit_app,tag:$tag,build_id:$build_id,build_started_at:$build_started_at,script:(if $script_etag == "" then null else $script end),script_etag:(if $script_etag == "" then null else $script_etag end),build_ok:($build_ok == "1"),despliegue:(if $despliegue == "ok" then "ok" else "fallo" end),despliegue_detalle:$despliegue_detalle,imagen_otro_servicio:(if $otro_imagen == "" then null else $otro_imagen end),imagen_otro_servicio_motivo:(if $otro_motivo == "" then null else $otro_motivo end)}'
+      - if [ -s "$ESPERA_RESULTADO" ]; then export ESPERA_MOTIVO=""; elif [ "${DESPLIEGUE:-}" != "ok" ]; then export ESPERA_MOTIVO="no se corrio, el despliegue no termino ok"; else export ESPERA_MOTIVO="no se corrio, no se pudo bajar o ejecutar esperar-entorno.sh"; fi
+      - if [ -s "$SUITE_RESULTADO" ]; then export SUITE_MOTIVO=""; elif [ "${DESPLIEGUE:-}" != "ok" ]; then export SUITE_MOTIVO="no se corrio, el despliegue no termino ok"; elif [ "${ESPERA:-}" != "ok" ]; then export SUITE_MOTIVO="no se corrio, el entorno no respondio"; else export SUITE_MOTIVO="no se corrio, no se pudo bajar o ejecutar ejecutar-suite.sh"; fi
+      - jq -nc --arg servicio "$SERVICIO" --arg cd_repo "$GITHUB_CD_REPO" --arg cd_commit "$CODEBUILD_RESOLVED_SOURCE_VERSION" --arg cd_commit_at "${SRC_COMMIT_AT:-}" --arg trigger "${CODEBUILD_WEBHOOK_TRIGGER:-}" --arg imagen "$TAG_REPO@$TAG_DIGEST" --arg commit_app "$TAG_COMMIT" --arg tag "$TAG_TAG" --arg build_id "$CODEBUILD_BUILD_ID" --arg build_started_at "$BUILD_STARTED_AT" --arg script "s3://$SCRIPTS_BUCKET/$SCRIPT_KEY" --arg script_etag "${SCRIPT_ETAG:-}" --arg despliegue "${DESPLIEGUE:-}" --arg build_ok "${CODEBUILD_BUILD_SUCCEEDING:-0}" --arg otro_imagen "$OTRO_IMAGEN" --arg otro_motivo "$OTRO_MOTIVO" --arg espera_etag "${ESPERA_ETAG:-}" --arg espera_motivo "${ESPERA_MOTIVO:-}" --argjson espera "$([ -s "$ESPERA_RESULTADO" ] && cat "$ESPERA_RESULTADO" || echo null)" --arg suite_etag "${SUITE_ETAG:-}" --arg suite_motivo "${SUITE_MOTIVO:-}" --argjson suite "$([ -s "$SUITE_RESULTADO" ] && cat "$SUITE_RESULTADO" || echo null)" --argjson despliegue_detalle "$([ -s "$DESPLIEGUE_RESULTADO" ] && cat "$DESPLIEGUE_RESULTADO" || echo null)" '{servicio:$servicio,cd_repo:$cd_repo,cd_commit:$cd_commit,cd_commit_at:(if $cd_commit_at == "" then null else $cd_commit_at end),trigger:(if $trigger == "" then null else $trigger end),imagen:$imagen,commit_app:$commit_app,tag:$tag,build_id:$build_id,build_started_at:$build_started_at,script:(if $script_etag == "" then null else $script end),script_etag:(if $script_etag == "" then null else $script_etag end),build_ok:($build_ok == "1"),despliegue:(if $despliegue == "ok" then "ok" else "fallo" end),despliegue_detalle:$despliegue_detalle,imagen_otro_servicio:(if $otro_imagen == "" then null else $otro_imagen end),imagen_otro_servicio_motivo:(if $otro_motivo == "" then null else $otro_motivo end),espera_script_etag:(if $espera_etag == "" then null else $espera_etag end),espera:$espera,espera_motivo:(if $espera_motivo == "" then null else $espera_motivo end),suite_script_etag:(if $suite_etag == "" then null else $suite_etag end),suite:$suite,suite_motivo:(if $suite_motivo == "" then null else $suite_motivo end)}'
