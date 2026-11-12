@@ -1,0 +1,50 @@
+version: 0.2
+
+# Despliegue al entorno efímero de una rama de versión (release/c<N>-<n> o hotfix/c<N>-<n>).
+# Fuente: el repo -cd en el commit de la rama que disparó el webhook.
+# Versión MÍNIMA: solo valida y reporta, sin tocar AWS, para probar el disparo de los webhooks.
+# Pasos siguientes (no implementados): serialización por entorno, crear el entorno si no existe,
+# desplegar el servicio del repo, espera, suite y registro.
+#
+# Rama: CODEBUILD_WEBHOOK_HEAD_REF sin refs/heads/ o, si el build fue manual, CODEBUILD_SOURCE_VERSION.
+# Tiene que cumplir ^(release|hotfix)/c[0-9]+-[0-9]+$. slug = rama en minúsculas con / -> - (20
+# caracteres o menos); corrida = c<N>. tag.json tiene que traer repo, commit, tag, digest y rama, y su
+# rama tiene que ser la del build.
+# Termina siempre con una línea JSON con el contexto del disparo y resultado (ok o el motivo de falla):
+# si falla la validación, la imprime el finally de pre_build (con ABORT no corre post_build); si no,
+# post_build.
+# SERVICIO y GITHUB_CD_REPO no van acá: los pone el proyecto.
+
+env:
+  shell: bash
+  variables:
+    TAG_FILE: tag.json
+    MODELO: efimero
+    SCRIPTS_PREFIX: main
+
+phases:
+  pre_build:
+    on-failure: ABORT
+    commands:
+      - export BUILD_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; export MOTIVO=""; export VALIDACION_OK=""; export RAMA=""; export RAMA_ORIGEN=""; export SLUG=""; export CORRIDA=""; export TAG_REPO=""; export TAG_COMMIT=""; export TAG_TAG=""; export TAG_DIGEST=""; export TAG_RAMA=""
+      - MISSING=""; for v in MODELO SERVICIO GITHUB_CD_REPO TAG_FILE SCRIPTS_PREFIX; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { export MOTIVO="faltan variables$MISSING"; echo "ERROR - $MOTIVO"; false; }
+      - '[ "$MODELO" = "efimero" ] || { export MOTIVO="MODELO tiene que ser efimero ($MODELO)"; echo "ERROR - $MOTIVO"; false; }'
+      - '[[ "$SERVICIO" =~ ^(backend|frontend)$ ]] || { export MOTIVO="SERVICIO tiene que ser backend o frontend ($SERVICIO)"; echo "ERROR - $MOTIVO"; false; }'
+      - if [ -n "${CODEBUILD_WEBHOOK_HEAD_REF:-}" ]; then export RAMA_ORIGEN="CODEBUILD_WEBHOOK_HEAD_REF"; export RAMA="${CODEBUILD_WEBHOOK_HEAD_REF#refs/heads/}"; else export RAMA_ORIGEN="CODEBUILD_SOURCE_VERSION (build manual)"; export RAMA="${CODEBUILD_SOURCE_VERSION:-}"; export RAMA="${RAMA#refs/heads/}"; fi; echo "Rama ${RAMA:-<vacia>} (de $RAMA_ORIGEN)"
+      - '[[ "$RAMA" =~ ^(release|hotfix)/c([0-9]+)-[0-9]+$ ]] && export CORRIDA="c${BASH_REMATCH[2]}" || { export MOTIVO="la rama ${RAMA:-<vacia>} no es de version, tiene que cumplir ^(release|hotfix)/c[0-9]+-[0-9]+$"; echo "ERROR - $MOTIVO"; false; }'
+      - export SLUG="$(printf '%s' "$RAMA" | tr '[:upper:]' '[:lower:]' | tr / -)"; echo "Slug $SLUG (${#SLUG} caracteres), corrida $CORRIDA"
+      - '[ "${#SLUG}" -le 20 ] || { export MOTIVO="el slug $SLUG tiene ${#SLUG} caracteres, el maximo es 20"; echo "ERROR - $MOTIVO"; false; }'
+      - '[ -f "$TAG_FILE" ] || { export MOTIVO="no existe $TAG_FILE en la raiz de la fuente"; echo "ERROR - $MOTIVO"; false; }'
+      - jq -e 'all(.repo, .commit, .tag, .digest, .rama; type == "string" and length > 0)' "$TAG_FILE" > /dev/null || { export MOTIVO="$TAG_FILE no tiene repo, commit, tag, digest y rama"; echo "ERROR - $MOTIVO"; cat "$TAG_FILE"; false; }
+      - export TAG_REPO="$(jq -r .repo "$TAG_FILE")"; export TAG_COMMIT="$(jq -r .commit "$TAG_FILE")"; export TAG_TAG="$(jq -r .tag "$TAG_FILE")"; export TAG_DIGEST="$(jq -r .digest "$TAG_FILE")"; export TAG_RAMA="$(jq -r .rama "$TAG_FILE")"
+      - '[[ "$TAG_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { export MOTIVO="digest con formato invalido ($TAG_DIGEST)"; echo "ERROR - $MOTIVO"; false; }'
+      - '[ "$TAG_RAMA" = "$RAMA" ] || { export MOTIVO="la rama de $TAG_FILE ($TAG_RAMA) no es la del build ($RAMA)"; echo "ERROR - $MOTIVO"; false; }'
+      - export VALIDACION_OK=1; echo "Validacion ok - servicio $SERVICIO, rama $RAMA, slug $SLUG, corrida $CORRIDA, imagen $TAG_REPO@$TAG_DIGEST (commit $TAG_COMMIT, tag $TAG_TAG)"
+    finally:
+      - if [ "${VALIDACION_OK:-}" != "1" ]; then export RESULTADO="${MOTIVO:-fallo inesperado en pre_build}"; jq -nc --arg modelo "${MODELO:-}" --arg servicio "${SERVICIO:-}" --arg build_id "${CODEBUILD_BUILD_ID:-}" --arg build_started_at "${BUILD_STARTED_AT:-}" --arg rama "${RAMA:-}" --arg slug "${SLUG:-}" --arg corrida "${CORRIDA:-}" --arg digest "${TAG_DIGEST:-}" --arg tag_repo "${TAG_REPO:-}" --arg commit "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" --arg webhook_event "${CODEBUILD_WEBHOOK_EVENT:-}" --arg webhook_trigger "${CODEBUILD_WEBHOOK_TRIGGER:-}" --arg webhook_actor "${CODEBUILD_WEBHOOK_ACTOR_ACCOUNT_ID:-}" --arg resultado "$RESULTADO" 'def n:if . == "" then null else . end; {modelo:($modelo|n),servicio:($servicio|n),build_id:($build_id|n),build_started_at:($build_started_at|n),rama:($rama|n),slug:($slug|n),corrida:($corrida|n),digest:($digest|n),imagen:(if $tag_repo != "" and $digest != "" then "\($tag_repo)@\($digest)" else null end),commit:($commit|n),webhook_event:($webhook_event|n),webhook_trigger:($webhook_trigger|n),webhook_actor_account_id:($webhook_actor|n),resultado:$resultado}'; fi
+  build:
+    commands:
+      - echo "Pasos siguientes no implementados todavia (serializacion por entorno, crear el entorno, desplegar $SERVICIO, espera, suite y registro); no se hace nada"
+  post_build:
+    commands:
+      - if [ "${VALIDACION_OK:-}" = "1" ] && [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ]; then export RESULTADO="ok"; else export RESULTADO="${MOTIVO:-fallo en build}"; fi; jq -nc --arg modelo "${MODELO:-}" --arg servicio "${SERVICIO:-}" --arg build_id "${CODEBUILD_BUILD_ID:-}" --arg build_started_at "${BUILD_STARTED_AT:-}" --arg rama "${RAMA:-}" --arg slug "${SLUG:-}" --arg corrida "${CORRIDA:-}" --arg digest "${TAG_DIGEST:-}" --arg tag_repo "${TAG_REPO:-}" --arg commit "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" --arg webhook_event "${CODEBUILD_WEBHOOK_EVENT:-}" --arg webhook_trigger "${CODEBUILD_WEBHOOK_TRIGGER:-}" --arg webhook_actor "${CODEBUILD_WEBHOOK_ACTOR_ACCOUNT_ID:-}" --arg resultado "$RESULTADO" 'def n:if . == "" then null else . end; {modelo:($modelo|n),servicio:($servicio|n),build_id:($build_id|n),build_started_at:($build_started_at|n),rama:($rama|n),slug:($slug|n),corrida:($corrida|n),digest:($digest|n),imagen:(if $tag_repo != "" and $digest != "" then "\($tag_repo)@\($digest)" else null end),commit:($commit|n),webhook_event:($webhook_event|n),webhook_trigger:($webhook_trigger|n),webhook_actor_account_id:($webhook_actor|n),resultado:$resultado}'
