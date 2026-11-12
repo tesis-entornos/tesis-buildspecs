@@ -2,9 +2,8 @@ version: 0.2
 
 # Despliegue al entorno efímero de una rama de versión (release/c<N>-<n> o hotfix/c<N>-<n>).
 # Fuente: el repo -cd en el commit de la rama que disparó el webhook.
-# Versión MÍNIMA: solo valida y reporta, sin tocar AWS, para probar el disparo de los webhooks.
-# Pasos siguientes (no implementados): serialización por entorno, crear el entorno si no existe,
-# desplegar el servicio del repo, espera, suite y registro.
+# Hoy: valida, deja la marca de turno y serializa por entorno. Pasos siguientes (no implementados):
+# crear el entorno si no existe, desplegar el servicio del repo, espera, suite y registro.
 #
 # Rama: CODEBUILD_WEBHOOK_HEAD_REF sin refs/heads/ o, si el build fue manual, CODEBUILD_SOURCE_VERSION.
 # Tiene que cumplir ^(release|hotfix)/c[0-9]+-[0-9]+$. slug = rama en minúsculas con / -> - (20
@@ -13,6 +12,13 @@ version: 0.2
 # Termina siempre con una línea JSON con el contexto del disparo y resultado (ok o el motivo de falla):
 # si falla la validación, la imprime el finally de pre_build (con ABORT no corre post_build); si no,
 # post_build.
+# Serialización por entorno: al final de pre_build, apenas pasa la validación, el build deja su marca
+# s3://MARCAS_BUCKET/entornos/<slug>/turnos/<build-id>.json {build_id, rama, slug, start_time} (no se
+# borra: queda como historia). El primer paso de build es scripts/esperar-turno.sh (del bucket, bajo
+# SCRIPTS_PREFIX): espera a los builds anteriores de la misma rama en PROYECTOS. Si la marca no se
+# puede escribir, pre_build aborta. El JSON del script va en el bloque serializacion de la línea final.
+# SIMULAR_TRABAJO_SEG: SOLO PARA PRUEBAS. Si es > 0, después de la serialización el build duerme esos
+# segundos, para poder probar la espera con builds superpuestos. En uso normal, 0.
 # SERVICIO y GITHUB_CD_REPO no van acá: los pone el proyecto.
 
 env:
@@ -20,15 +26,24 @@ env:
   variables:
     TAG_FILE: tag.json
     MODELO: efimero
+    SCRIPTS_BUCKET: tesis-entornos-buildspecs-582621604637
     SCRIPTS_PREFIX: main
+    TRABAJO_DIR: /tmp/efimero
+    MARCAS_BUCKET: tesis-entornos-tfstate-398846004421
+    PROYECTOS: tesis-efimero-desplegar-backend tesis-efimero-desplegar-frontend
+    INTERVALO_SEG: "15"
+    ESPERA_MAX_SEG: "3600"
+    SIMULAR_TRABAJO_SEG: "0"
 
 phases:
   pre_build:
     on-failure: ABORT
     commands:
-      - export BUILD_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; export MOTIVO=""; export VALIDACION_OK=""; export RAMA=""; export RAMA_ORIGEN=""; export SLUG=""; export CORRIDA=""; export TAG_REPO=""; export TAG_COMMIT=""; export TAG_TAG=""; export TAG_DIGEST=""; export TAG_RAMA=""
-      - MISSING=""; for v in MODELO SERVICIO GITHUB_CD_REPO TAG_FILE SCRIPTS_PREFIX; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { export MOTIVO="faltan variables$MISSING"; echo "ERROR - $MOTIVO"; false; }
+      - export BUILD_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; export MOTIVO=""; export VALIDACION_OK=""; export RAMA=""; export RAMA_ORIGEN=""; export SLUG=""; export CORRIDA=""; export TAG_REPO=""; export TAG_COMMIT=""; export TAG_TAG=""; export TAG_DIGEST=""; export TAG_RAMA=""; export MARCA_URI=""; export MARCA_ESCRITA=""; export SERIALIZACION="sin_correr"; export SERIALIZACION_ETAG=""; export SERIALIZACION_RESULTADO="$TRABAJO_DIR/serializacion.json"; rm -f "$SERIALIZACION_RESULTADO"
+      - MISSING=""; for v in MODELO SERVICIO GITHUB_CD_REPO TAG_FILE SCRIPTS_BUCKET SCRIPTS_PREFIX TRABAJO_DIR MARCAS_BUCKET PROYECTOS INTERVALO_SEG ESPERA_MAX_SEG SIMULAR_TRABAJO_SEG CODEBUILD_BUILD_ID; do [ -n "${!v:-}" ] || MISSING="$MISSING $v"; done; [ -z "$MISSING" ] || { export MOTIVO="faltan variables$MISSING"; echo "ERROR - $MOTIVO"; false; }
       - '[ "$MODELO" = "efimero" ] || { export MOTIVO="MODELO tiene que ser efimero ($MODELO)"; echo "ERROR - $MOTIVO"; false; }'
+      - '[[ "$SIMULAR_TRABAJO_SEG" =~ ^[0-9]+$ ]] || { export MOTIVO="SIMULAR_TRABAJO_SEG tiene que ser un entero >= 0 ($SIMULAR_TRABAJO_SEG)"; echo "ERROR - $MOTIVO"; false; }'
+      - '[[ "$MARCAS_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || { export MOTIVO="MARCAS_BUCKET invalido ($MARCAS_BUCKET)"; echo "ERROR - $MOTIVO"; false; }'
       - '[[ "$SERVICIO" =~ ^(backend|frontend)$ ]] || { export MOTIVO="SERVICIO tiene que ser backend o frontend ($SERVICIO)"; echo "ERROR - $MOTIVO"; false; }'
       - if [ -n "${CODEBUILD_WEBHOOK_HEAD_REF:-}" ]; then export RAMA_ORIGEN="CODEBUILD_WEBHOOK_HEAD_REF"; export RAMA="${CODEBUILD_WEBHOOK_HEAD_REF#refs/heads/}"; else export RAMA_ORIGEN="CODEBUILD_SOURCE_VERSION (build manual)"; export RAMA="${CODEBUILD_SOURCE_VERSION:-}"; export RAMA="${RAMA#refs/heads/}"; fi; echo "Rama ${RAMA:-<vacia>} (de $RAMA_ORIGEN)"
       - '[[ "$RAMA" =~ ^(release|hotfix)/c([0-9]+)-[0-9]+$ ]] && export CORRIDA="c${BASH_REMATCH[2]}" || { export MOTIVO="la rama ${RAMA:-<vacia>} no es de version, tiene que cumplir ^(release|hotfix)/c[0-9]+-[0-9]+$"; echo "ERROR - $MOTIVO"; false; }'
@@ -39,12 +54,16 @@ phases:
       - export TAG_REPO="$(jq -r .repo "$TAG_FILE")"; export TAG_COMMIT="$(jq -r .commit "$TAG_FILE")"; export TAG_TAG="$(jq -r .tag "$TAG_FILE")"; export TAG_DIGEST="$(jq -r .digest "$TAG_FILE")"; export TAG_RAMA="$(jq -r .rama "$TAG_FILE")"
       - '[[ "$TAG_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { export MOTIVO="digest con formato invalido ($TAG_DIGEST)"; echo "ERROR - $MOTIVO"; false; }'
       - '[ "$TAG_RAMA" = "$RAMA" ] || { export MOTIVO="la rama de $TAG_FILE ($TAG_RAMA) no es la del build ($RAMA)"; echo "ERROR - $MOTIVO"; false; }'
+      - export MARCA_URI="s3://$MARCAS_BUCKET/entornos/$SLUG/turnos/$CODEBUILD_BUILD_ID.json"; export START_TIME="$(aws codebuild batch-get-builds --ids "$CODEBUILD_BUILD_ID" --query 'builds[0].startTime' --output text 2> /dev/null)"; [ -n "$START_TIME" ] && [ "$START_TIME" != "None" ] && jq -nc --arg build_id "$CODEBUILD_BUILD_ID" --arg rama "$RAMA" --arg slug "$SLUG" --arg start_time "$START_TIME" '{build_id:$build_id,rama:$rama,slug:$slug,start_time:$start_time}' | aws s3 cp - "$MARCA_URI" --content-type application/json --only-show-errors && export MARCA_ESCRITA=1 && echo "Marca de turno $MARCA_URI (start_time $START_TIME)" || { export MOTIVO="no se pudo escribir la marca de turno $MARCA_URI (start_time ${START_TIME:-<sin leer>})"; echo "ERROR - $MOTIVO"; false; }
       - export VALIDACION_OK=1; echo "Validacion ok - servicio $SERVICIO, rama $RAMA, slug $SLUG, corrida $CORRIDA, imagen $TAG_REPO@$TAG_DIGEST (commit $TAG_COMMIT, tag $TAG_TAG)"
     finally:
-      - if [ "${VALIDACION_OK:-}" != "1" ]; then export RESULTADO="${MOTIVO:-fallo inesperado en pre_build}"; jq -nc --arg modelo "${MODELO:-}" --arg servicio "${SERVICIO:-}" --arg build_id "${CODEBUILD_BUILD_ID:-}" --arg build_started_at "${BUILD_STARTED_AT:-}" --arg rama "${RAMA:-}" --arg slug "${SLUG:-}" --arg corrida "${CORRIDA:-}" --arg digest "${TAG_DIGEST:-}" --arg tag_repo "${TAG_REPO:-}" --arg commit "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" --arg webhook_event "${CODEBUILD_WEBHOOK_EVENT:-}" --arg webhook_trigger "${CODEBUILD_WEBHOOK_TRIGGER:-}" --arg webhook_actor "${CODEBUILD_WEBHOOK_ACTOR_ACCOUNT_ID:-}" --arg resultado "$RESULTADO" 'def n:if . == "" then null else . end; {modelo:($modelo|n),servicio:($servicio|n),build_id:($build_id|n),build_started_at:($build_started_at|n),rama:($rama|n),slug:($slug|n),corrida:($corrida|n),digest:($digest|n),imagen:(if $tag_repo != "" and $digest != "" then "\($tag_repo)@\($digest)" else null end),commit:($commit|n),webhook_event:($webhook_event|n),webhook_trigger:($webhook_trigger|n),webhook_actor_account_id:($webhook_actor|n),resultado:$resultado}'; fi
+      - if [ "${VALIDACION_OK:-}" != "1" ]; then export RESULTADO="${MOTIVO:-fallo inesperado en pre_build}"; jq -nc --arg modelo "${MODELO:-}" --arg servicio "${SERVICIO:-}" --arg build_id "${CODEBUILD_BUILD_ID:-}" --arg build_started_at "${BUILD_STARTED_AT:-}" --arg rama "${RAMA:-}" --arg slug "${SLUG:-}" --arg corrida "${CORRIDA:-}" --arg digest "${TAG_DIGEST:-}" --arg tag_repo "${TAG_REPO:-}" --arg commit "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" --arg webhook_event "${CODEBUILD_WEBHOOK_EVENT:-}" --arg webhook_trigger "${CODEBUILD_WEBHOOK_TRIGGER:-}" --arg webhook_actor "${CODEBUILD_WEBHOOK_ACTOR_ACCOUNT_ID:-}" --arg marca "$([ "${MARCA_ESCRITA:-}" = "1" ] && echo "${MARCA_URI:-}")" --arg serializacion_etag "${SERIALIZACION_ETAG:-}" --argjson serializacion "$([ -s "${SERIALIZACION_RESULTADO:-/nonexistent}" ] && cat "$SERIALIZACION_RESULTADO" || echo null)" --arg simular "${SIMULAR_TRABAJO_SEG:-0}" --arg resultado "$RESULTADO" 'def n:if . == "" then null else . end; {modelo:($modelo|n),servicio:($servicio|n),build_id:($build_id|n),build_started_at:($build_started_at|n),rama:($rama|n),slug:($slug|n),corrida:($corrida|n),digest:($digest|n),imagen:(if $tag_repo != "" and $digest != "" then "\($tag_repo)@\($digest)" else null end),commit:($commit|n),webhook_event:($webhook_event|n),webhook_trigger:($webhook_trigger|n),webhook_actor_account_id:($webhook_actor|n),marca_turno:($marca|n),serializacion_script_etag:($serializacion_etag|n),serializacion:$serializacion,simular_trabajo_seg:($simular|tonumber? // null),resultado:$resultado}'; fi
   build:
     commands:
-      - echo "Pasos siguientes no implementados todavia (serializacion por entorno, crear el entorno, desplegar $SERVICIO, espera, suite y registro); no se hace nada"
+      - export SERIALIZACION="pendiente"; mkdir -p "$TRABAJO_DIR" && export SERIALIZACION_ETAG="$(aws s3api get-object --bucket "$SCRIPTS_BUCKET" --key "$SCRIPTS_PREFIX/scripts/esperar-turno.sh" "$TRABAJO_DIR/esperar-turno.sh" --query ETag --output text | tr -d '"')" && [ -n "$SERIALIZACION_ETAG" ] && echo "Script s3://$SCRIPTS_BUCKET/$SCRIPTS_PREFIX/scripts/esperar-turno.sh (ETag $SERIALIZACION_ETAG)" || { export SERIALIZACION="fallo"; export MOTIVO="no se pudo bajar s3://$SCRIPTS_BUCKET/$SCRIPTS_PREFIX/scripts/esperar-turno.sh"; echo "ERROR - $MOTIVO"; false; }
+      - SALIDA_JSON="$SERIALIZACION_RESULTADO" bash "$TRABAJO_DIR/esperar-turno.sh" && export SERIALIZACION="ok" || { export SERIALIZACION="fallo"; export MOTIVO="serializacion - $(jq -r '.motivo // "sin motivo"' "$SERIALIZACION_RESULTADO" 2> /dev/null || echo "sin resultado del script")"; echo "ERROR - $MOTIVO"; false; }
+      - if [ "$SIMULAR_TRABAJO_SEG" -gt 0 ]; then echo "SIMULAR_TRABAJO_SEG=$SIMULAR_TRABAJO_SEG, solo para pruebas - duerme $SIMULAR_TRABAJO_SEG s"; sleep "$SIMULAR_TRABAJO_SEG"; fi
+      - echo "Pasos siguientes no implementados todavia (crear el entorno, desplegar $SERVICIO, espera, suite y registro); no se hace nada"
   post_build:
     commands:
-      - if [ "${VALIDACION_OK:-}" = "1" ] && [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ]; then export RESULTADO="ok"; else export RESULTADO="${MOTIVO:-fallo en build}"; fi; jq -nc --arg modelo "${MODELO:-}" --arg servicio "${SERVICIO:-}" --arg build_id "${CODEBUILD_BUILD_ID:-}" --arg build_started_at "${BUILD_STARTED_AT:-}" --arg rama "${RAMA:-}" --arg slug "${SLUG:-}" --arg corrida "${CORRIDA:-}" --arg digest "${TAG_DIGEST:-}" --arg tag_repo "${TAG_REPO:-}" --arg commit "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" --arg webhook_event "${CODEBUILD_WEBHOOK_EVENT:-}" --arg webhook_trigger "${CODEBUILD_WEBHOOK_TRIGGER:-}" --arg webhook_actor "${CODEBUILD_WEBHOOK_ACTOR_ACCOUNT_ID:-}" --arg resultado "$RESULTADO" 'def n:if . == "" then null else . end; {modelo:($modelo|n),servicio:($servicio|n),build_id:($build_id|n),build_started_at:($build_started_at|n),rama:($rama|n),slug:($slug|n),corrida:($corrida|n),digest:($digest|n),imagen:(if $tag_repo != "" and $digest != "" then "\($tag_repo)@\($digest)" else null end),commit:($commit|n),webhook_event:($webhook_event|n),webhook_trigger:($webhook_trigger|n),webhook_actor_account_id:($webhook_actor|n),resultado:$resultado}'
+      - if [ "${VALIDACION_OK:-}" = "1" ] && [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" = "1" ]; then export RESULTADO="ok"; else export RESULTADO="${MOTIVO:-fallo en build}"; fi; jq -nc --arg modelo "${MODELO:-}" --arg servicio "${SERVICIO:-}" --arg build_id "${CODEBUILD_BUILD_ID:-}" --arg build_started_at "${BUILD_STARTED_AT:-}" --arg rama "${RAMA:-}" --arg slug "${SLUG:-}" --arg corrida "${CORRIDA:-}" --arg digest "${TAG_DIGEST:-}" --arg tag_repo "${TAG_REPO:-}" --arg commit "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" --arg webhook_event "${CODEBUILD_WEBHOOK_EVENT:-}" --arg webhook_trigger "${CODEBUILD_WEBHOOK_TRIGGER:-}" --arg webhook_actor "${CODEBUILD_WEBHOOK_ACTOR_ACCOUNT_ID:-}" --arg marca "$([ "${MARCA_ESCRITA:-}" = "1" ] && echo "${MARCA_URI:-}")" --arg serializacion_etag "${SERIALIZACION_ETAG:-}" --argjson serializacion "$([ -s "${SERIALIZACION_RESULTADO:-/nonexistent}" ] && cat "$SERIALIZACION_RESULTADO" || echo null)" --arg simular "${SIMULAR_TRABAJO_SEG:-0}" --arg resultado "$RESULTADO" 'def n:if . == "" then null else . end; {modelo:($modelo|n),servicio:($servicio|n),build_id:($build_id|n),build_started_at:($build_started_at|n),rama:($rama|n),slug:($slug|n),corrida:($corrida|n),digest:($digest|n),imagen:(if $tag_repo != "" and $digest != "" then "\($tag_repo)@\($digest)" else null end),commit:($commit|n),webhook_event:($webhook_event|n),webhook_trigger:($webhook_trigger|n),webhook_actor_account_id:($webhook_actor|n),marca_turno:($marca|n),serializacion_script_etag:($serializacion_etag|n),serializacion:$serializacion,simular_trabajo_seg:($simular|tonumber? // null),resultado:$resultado}'
