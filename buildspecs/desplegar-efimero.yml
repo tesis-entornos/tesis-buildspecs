@@ -63,7 +63,7 @@ env:
     TRABAJO_DIR: /tmp/efimero
     MARCAS_BUCKET: tesis-entornos-tfstate-398846004421
     STATES_BUCKET: tesis-entornos-tfstate-398846004421
-    PROYECTOS: tesis-efimero-desplegar-backend tesis-efimero-desplegar-frontend
+    PROYECTOS: tesis-efimero-desplegar-backend tesis-efimero-desplegar-frontend tesis-efimero-cerrar-backend tesis-efimero-cerrar-frontend
     INTERVALO_SEG: "15"
     ESPERA_MAX_SEG: "3600"
     SIMULAR_TRABAJO_SEG: "0"
