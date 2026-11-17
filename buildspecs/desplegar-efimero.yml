@@ -15,7 +15,8 @@ version: 0.2
 # Tiene que cumplir ^(release|hotfix)/c[0-9]+-[0-9]+$. slug = rama en minúsculas con / -> - (20
 # caracteres o menos); corrida = c<N>; N = el n de la rama (release/c1-7 -> 7), entre 1 y 99: la
 # prioridad de su regla en el listener es N*10. tag.json tiene que traer repo, commit, tag, digest y
-# rama, y su rama tiene que ser la del build.
+# rama, y su rama tiene que ser la del build. Si trae modelo, tiene que ser efimero: un tag.json de otro
+# modelo no se despliega (MOTIVO "tag.json de otro modelo").
 # Imágenes de producción (con las que se crea el entorno): tag.json de main de cada -cd (repo, commit,
 # tag, digest; sin rama). El propio sale de git show origin/main:tag.json en la fuente principal; el del
 # otro servicio, de su fuente secundaria. Se registran los commits de origin/main propio, de la fuente
@@ -112,6 +113,7 @@ phases:
       - export TAG_REPO="$(jq -r .repo "$TAG_FILE")"; export TAG_COMMIT="$(jq -r .commit "$TAG_FILE")"; export TAG_TAG="$(jq -r .tag "$TAG_FILE")"; export TAG_DIGEST="$(jq -r .digest "$TAG_FILE")"; export TAG_RAMA="$(jq -r .rama "$TAG_FILE")"
       - '[[ "$TAG_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { export MOTIVO="digest con formato invalido ($TAG_DIGEST)"; echo "ERROR - $MOTIVO"; false; }'
       - '[ "$TAG_RAMA" = "$RAMA" ] || { export MOTIVO="la rama de $TAG_FILE ($TAG_RAMA) no es la del build ($RAMA)"; echo "ERROR - $MOTIVO"; false; }'
+      - jq -e '(has("modelo") | not) or .modelo == "efimero"' "$TAG_FILE" > /dev/null || { export MOTIVO="tag.json de otro modelo (modelo $(jq -c .modelo "$TAG_FILE"), se esperaba efimero)"; echo "ERROR - $MOTIVO"; false; }
       - if [ "$SERVICIO" = "backend" ]; then export OTRO_SERVICIO="frontend"; else export OTRO_SERVICIO="backend"; fi; export OTRO_FUENTE="${OTRO_SERVICIO}_cd_main"; export OTRO_FUENTE_VAR="CODEBUILD_SRC_DIR_$OTRO_FUENTE"; export OTRO_DIR="${!OTRO_FUENTE_VAR:-}"; export TERRAFORM_DIR="${CODEBUILD_SRC_DIR_terraform:-}/$TERRAFORM_SUBDIR"; echo "Fuente $OTRO_FUENTE en ${OTRO_DIR:-<vacia>}, fuente terraform en ${CODEBUILD_SRC_DIR_terraform:-<vacia>}"
       - '[ -n "$OTRO_DIR" ] && [ -f "$OTRO_DIR/$TAG_FILE" ] || { export MOTIVO="falta la fuente secundaria $OTRO_FUENTE o su $TAG_FILE ($OTRO_FUENTE_VAR=${OTRO_DIR:-<vacia>})"; echo "ERROR - $MOTIVO"; false; }'
       - '[ -n "${CODEBUILD_SRC_DIR_terraform:-}" ] && [ -d "$TERRAFORM_DIR" ] || { export MOTIVO="falta la fuente secundaria terraform o su directorio $TERRAFORM_SUBDIR (CODEBUILD_SRC_DIR_terraform=${CODEBUILD_SRC_DIR_terraform:-<vacia>})"; echo "ERROR - $MOTIVO"; false; }'

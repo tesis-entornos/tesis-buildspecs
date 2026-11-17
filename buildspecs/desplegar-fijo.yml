@@ -51,6 +51,7 @@ phases:
       - '[[ "$REGISTROS_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || { echo "ERROR - REGISTROS_BUCKET invalido ($REGISTROS_BUCKET)"; false; }'
       - '[[ "$SIMULAR_TRABAJO_SEG" =~ ^[0-9]+$ ]] || { export MOTIVO="SIMULAR_TRABAJO_SEG tiene que ser un entero >= 0 ($SIMULAR_TRABAJO_SEG)"; echo "ERROR - $MOTIVO"; false; }'
       - export TAG_RAMA="$(jq -r 'if (.rama | type) == "string" then .rama else empty end' "$TAG_FILE")"; if [[ "$TAG_RAMA" =~ ^(release|hotfix)/c([0-9]+)- ]]; then export CORRIDA="c${BASH_REMATCH[2]}"; else export CORRIDA="sin-corrida"; fi; export REGISTRO_URI="s3://$REGISTROS_BUCKET/validaciones/corrida=$CORRIDA/${CODEBUILD_BUILD_ID##*:}/"; echo "Rama ${TAG_RAMA:-<sin rama>}, corrida $CORRIDA, registro $REGISTRO_URI"
+      - jq -e '(has("modelo") | not) or .modelo == "fijo"' "$TAG_FILE" > /dev/null || { export MOTIVO="tag.json de otro modelo (modelo $(jq -c .modelo "$TAG_FILE"), se esperaba fijo)"; echo "ERROR - $MOTIVO"; false; }
       - echo "Servicio $SERVICIO, imagen $TAG_REPO@$TAG_DIGEST (commit $TAG_COMMIT, tag $TAG_TAG)"
   build:
     commands:
